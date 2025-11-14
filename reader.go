@@ -478,7 +478,6 @@ func (this *PdfReader) resolveCompressedObject(objSpec *PdfValue) (*PdfValue, er
 
 	// Get object id and index
 	objectId := this.xrefStream[objSpec.Id][0]
-	objectIndex := this.xrefStream[objSpec.Id][1]
 
 	// Read compressed object
 	compressedObjSpec := &PdfValue{Type: PDF_TYPE_OBJREF, Id: objectId, Gen: 0}
@@ -567,7 +566,7 @@ func (this *PdfReader) resolveCompressedObject(objSpec *PdfValue) (*PdfValue, er
 			return nil, errors.Wrap(err, "Failed to convert token into integer: "+token)
 		}
 
-		if i == objectIndex {
+		if _objidx == objSpec.Id {
 			subObjId = _objidx
 			subObjPos = _objpos
 		}
@@ -614,6 +613,7 @@ func (this *PdfReader) resolveObject(objSpec *PdfValue) (*PdfValue, error) {
 	r := bufio.NewReader(this.f)
 
 	if objSpec.Type == PDF_TYPE_OBJREF {
+
 		// This is a reference, resolve it.
 		offset := this.xref[objSpec.Id][objSpec.Gen]
 
@@ -702,19 +702,26 @@ func (this *PdfReader) resolveObject(objSpec *PdfValue) (*PdfValue, error) {
 				if err != nil {
 					return nil, errors.Wrap(err, "Failed to resolve length object of stream")
 				}
-
 				// Set length to resolved object value
 				length = lengthDict.Value.Int
+				// Sometimes completely off if broken, in which case we read up to the endstream token.
 			}
 
+			streamObj := &PdfValue{}
+			streamObj.Type = PDF_TYPE_STREAM
+
 			// Read length bytes
-			bytes := make([]byte, length)
+			streamObj.Bytes = make([]byte, length)
 
 			// Cannot use reader.Read() because that may not read all the bytes
-			_, err := io.ReadFull(r, bytes)
+			_, err := io.ReadFull(r, streamObj.Bytes)
 			if err != nil {
 				return nil, errors.Wrap(err, "Failed to read bytes from buffer")
 			}
+
+			// Reset the stack because who know where it comes from, it can be polluted by another
+			// read at this point and messes up with the next readToken call.
+			this.stack = []string{}
 
 			token, err = this.readToken(r)
 			if err != nil {
@@ -728,11 +735,6 @@ func (this *PdfReader) resolveObject(objSpec *PdfValue) (*PdfValue, error) {
 			if err != nil {
 				return nil, errors.Wrap(err, "Failed to read token")
 			}
-
-			streamObj := &PdfValue{}
-			streamObj.Type = PDF_TYPE_STREAM
-			streamObj.Bytes = bytes
-
 			result.Stream = streamObj
 		}
 
@@ -1391,7 +1393,7 @@ func (this *PdfReader) getPageContent(objSpec *PdfValue) ([]*PdfValue, error) {
 		for i := 0; i < len(objSpec.Array); i++ {
 			tmpContents, err := this.getPageContent(objSpec.Array[i])
 			if err != nil {
-				return nil, errors.Wrap(err, "Failed to get page content")
+				return nil, errors.Wrap(err, "Failed to get page content 2")
 			}
 			for j := 0; j < len(tmpContents); j++ {
 				contents = append(contents, tmpContents[j])
@@ -1424,7 +1426,7 @@ func (this *PdfReader) getContent(pageno int) (string, error) {
 		// Get an array of page content
 		contents, err = this.getPageContent(page.Value.Dictionary["/Contents"])
 		if err != nil {
-			return "", errors.Wrap(err, "Failed to get page content")
+			return "", errors.Wrapf(err, "Failed to get page content")
 		}
 
 		for i := 0; i < len(contents); i++ {
@@ -1511,7 +1513,10 @@ func (this *PdfReader) rebuildContentStream(content *PdfValue) ([]byte, error) {
 		case "/FlateDecode":
 			// Uncompress zlib compressed data
 			var out bytes.Buffer
-			zlibReader, _ := zlib.NewReader(bytes.NewBuffer(stream))
+			zlibReader, err := zlib.NewReader(bytes.NewBuffer(stream))
+			if err != nil {
+				return nil, errors.Wrapf(err, "Failed to create zlib reader for stream: %v", stream)
+			}
 
 			defer zlibReader.Close()
 			io.Copy(&out, zlibReader)

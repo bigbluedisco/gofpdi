@@ -1,4 +1,4 @@
-module github.com/happyreturns/gofpdi
+module github.com/bigbluedisco/gofpdi
 
 go 1.16
 

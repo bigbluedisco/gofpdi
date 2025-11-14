@@ -311,7 +311,7 @@ func (this *PdfWriter) writeValue(value *PdfValue) {
 		// Get object ID from don_obj_stack
 		objId := this.don_obj_stack[value.Id].NewId
 		this.outObjRef(objId)
-		//this.out(fmt.Sprintf("%d 0 R", objId))
+		// this.out(fmt.Sprintf("%d 0 R", objId))
 		break
 
 	case PDF_TYPE_STRING:
@@ -353,7 +353,7 @@ func (this *PdfWriter) PutFormXobjects(reader *PdfReader) (map[string]*PdfObject
 	this.r = reader
 
 	var err error
-	var result = make(map[string]*PdfObjectId, 0)
+	result := make(map[string]*PdfObjectId, 0)
 
 	compress := true
 	filter := ""
