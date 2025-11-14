@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"encoding/ascii85"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/pkg/errors"
 )
@@ -30,6 +32,14 @@ type PdfReader struct {
 	curPage        int
 	alreadyRead    bool
 	pageCount      int
+}
+
+type Ascii85DecodeError struct {
+	Message string
+}
+
+func (e *Ascii85DecodeError) Error() string {
+	return fmt.Sprintf("error decoding ascii85: %s", e.Message)
 }
 
 func NewPdfReaderFromStream(sourceFile string, rs io.ReadSeeker) (*PdfReader, error) {
@@ -105,6 +115,9 @@ func (this *PdfReader) skipComments(r *bufio.Reader) error {
 	for {
 		b, err = r.ReadByte()
 		if err != nil {
+			if err == io.EOF {
+				break
+			}
 			return errors.Wrap(err, "Failed to ReadByte while skipping comments")
 		}
 
@@ -185,6 +198,9 @@ func (this *PdfReader) readToken(r *bufio.Reader) (string, error) {
 		// Determine the appropriate case and return the token.
 		nb, err := r.ReadByte()
 		if err != nil {
+			if err == io.EOF {
+				return string(b), nil
+			}
 			return "", errors.Wrap(err, "Failed to read byte")
 		}
 		if nb == b {
@@ -210,6 +226,9 @@ func (this *PdfReader) readToken(r *bufio.Reader) (string, error) {
 		for {
 			b, err := r.ReadByte()
 			if err != nil {
+				if err == io.EOF {
+					break loop
+				}
 				return "", errors.Wrap(err, "Failed to read byte")
 			}
 			switch b {
@@ -222,8 +241,6 @@ func (this *PdfReader) readToken(r *bufio.Reader) (string, error) {
 		}
 		return str, nil
 	}
-
-	return "", nil
 }
 
 // Read a value based on a token
@@ -349,7 +366,6 @@ func (this *PdfReader) readValue(r *bufio.Reader, t string) (*PdfValue, error) {
 		// Read bytes until brackets are balanced
 		for openBrackets > 0 {
 			b, err := r.ReadByte()
-
 			if err != nil {
 				return nil, errors.Wrap(err, "Failed to read byte")
 			}
@@ -492,7 +508,7 @@ func (this *PdfReader) resolveCompressedObject(objSpec *PdfValue) (*PdfValue, er
 	first := compressedObj.Value.Dictionary["/First"].Int
 
 	// Get length
-	//length := compressedObj.Value.Dictionary["/Length"].Int
+	// length := compressedObj.Value.Dictionary["/Length"].Int
 
 	// Check for filter
 	filter := ""
@@ -683,7 +699,6 @@ func (this *PdfReader) resolveObject(objSpec *PdfValue) (*PdfValue, error) {
 			// If lengthDict is an object reference, resolve the object and set length
 			if lengthDict.Type == PDF_TYPE_OBJREF {
 				lengthDict, err = this.resolveObject(lengthDict)
-
 				if err != nil {
 					return nil, errors.Wrap(err, "Failed to resolve length object of stream")
 				}
@@ -790,6 +805,11 @@ func (this *PdfReader) findXref() error {
 			// Successfully read the xref position
 			this.xrefPos = result
 			break
+		}
+
+		// (token, err) == ("", nil) indicates EOF reached before finding "startxref"
+		if token == "" {
+			return errors.New("Failed to find startxref token")
 		}
 	}
 
@@ -904,7 +924,7 @@ func (this *PdfReader) readXref() error {
 						this.trailer = v
 					} else {
 						// Don't return an error here.  The trailer could be in another XRef stream.
-						//return errors.New("Did not set root object")
+						// return errors.New("Did not set root object")
 					}
 
 					startObject := index[0]
@@ -923,7 +943,6 @@ func (this *PdfReader) readXref() error {
 					// If lengthDict is an object reference, resolve the object and set length
 					if lengthDict.Type == PDF_TYPE_OBJREF {
 						lengthDict, err = this.resolveObject(lengthDict)
-
 						if err != nil {
 							return errors.Wrap(err, "Failed to resolve length object of stream")
 						}
@@ -1294,21 +1313,56 @@ func (this *PdfReader) getPageResources(pageno int) (*PdfValue, error) {
 		// Otherwise, returned the resolved object
 		return res, nil
 	} else {
-		// If /Resources does not exist, check to see if /Parent exists and return that
+		// If /Resources does not exist, check to see if /Parent exists and return the /Resources
+		// from parent.
 		if _, ok := page.Value.Dictionary["/Parent"]; ok {
 			// Resolve parent object
-			res, err := this.resolveObject(page.Value.Dictionary["/Parent"])
+			parentPage, err := this.resolveObject(page.Value.Dictionary["/Parent"])
 			if err != nil {
 				return nil, errors.Wrap(err, "Failed to resolve parent object")
 			}
 
-			// If /Parent object type is PDF_TYPE_OBJECT, return its Value
-			if res.Type == PDF_TYPE_OBJECT {
-				return res.Value, nil
+			// If /Parent object type is PDF_TYPE_OBJECT, look for /Resources in its Value
+			if parentPage.Type == PDF_TYPE_OBJECT {
+				if _, ok := parentPage.Value.Dictionary["/Resources"]; ok {
+					// Resolve /Resources object
+					res, err := this.resolveObject(parentPage.Value.Dictionary["/Resources"])
+					if err != nil {
+						return nil, errors.Wrap(err, "Failed to resolve resources object from parent (object)")
+					}
+					// If type is PDF_TYPE_OBJECT, return its Value
+					if res.Type == PDF_TYPE_OBJECT {
+						return res.Value, nil
+					}
+
+					// Otherwise, returned the resolved object
+					return res, nil
+				}
+
+				// Return an empty PdfValue if /Resources is not found
+				return &PdfValue{}, nil
 			}
 
-			// Otherwise, return the resolved parent object
-			return res, nil
+			// If /Parent object type is PDF_TYPE_DICTIONARY, look for /Resources in its Dictionary
+			if parentPage.Type == PDF_TYPE_DICTIONARY {
+				if _, ok := parentPage.Dictionary["/Resources"]; ok {
+					// Resolve /Resources object
+					res, err := this.resolveObject(parentPage.Dictionary["/Resources"])
+					if err != nil {
+						return nil, errors.Wrap(err, "Failed to resolve resources object from parent (dictionary)")
+					}
+					// If type is PDF_TYPE_OBJECT, return its Value
+					if res.Type == PDF_TYPE_OBJECT {
+						return res.Value, nil
+					}
+
+					// Otherwise, returned the resolved object
+					return res, nil
+				}
+
+				// Return an empty PdfValue if /Resources is not found
+				return &PdfValue{}, nil
+			}
 		}
 	}
 
@@ -1352,6 +1406,7 @@ func (this *PdfReader) getPageContent(objSpec *PdfValue) ([]*PdfValue, error) {
 func (this *PdfReader) getContent(pageno int) (string, error) {
 	var err error
 	var contents []*PdfValue
+	var ascii85Err error
 
 	// Check to make sure page exists in pages slice
 	if len(this.pages) < pageno {
@@ -1373,11 +1428,33 @@ func (this *PdfReader) getContent(pageno int) (string, error) {
 		}
 
 		for i := 0; i < len(contents); i++ {
+			// If the pdf type is an object, check if its value is an array
+			// The actual content (Stream) is most likely here (This is the case for Canadapost shipping labels)
+			if contents[i].Type == PDF_TYPE_OBJECT {
+				if contents[i].Value != nil {
+					if contents[i].Value.Type == PDF_TYPE_ARRAY {
+						arrayContents, err := this.getPageContent(contents[i].Value)
+						if err != nil {
+							return "", errors.Wrap(err, "Failed to get page content from content array")
+						}
+						contents = append(contents, arrayContents...)
+					}
+				}
+			}
+			// If there is no stream, it will panic when trying to rebuild content stream
+			if contents[i].Stream == nil {
+				continue
+			}
 			// Decode content if one or more /Filter is specified.
 			// Most common filter is FlateDecode which can be uncompressed with zlib
 			tmpBuffer, err := this.rebuildContentStream(contents[i])
 			if err != nil {
-				return "", errors.Wrap(err, "Failed to rebuild content stream")
+				switch err.(type) {
+				case *Ascii85DecodeError:
+					ascii85Err = err
+				default:
+					return "", errors.Wrap(err, "Failed to rebuild content stream")
+				}
 			}
 
 			// FIXME:  This is probably slow
@@ -1385,6 +1462,9 @@ func (this *PdfReader) getContent(pageno int) (string, error) {
 		}
 	}
 
+	if ascii85Err != nil {
+		return buffer, ascii85Err
+	}
 	return buffer, nil
 }
 
@@ -1394,6 +1474,7 @@ func (this *PdfReader) getContent(pageno int) (string, error) {
 func (this *PdfReader) rebuildContentStream(content *PdfValue) ([]byte, error) {
 	var err error
 	var tmpFilter *PdfValue
+	var asciiDecodeErr *Ascii85DecodeError
 
 	// Allocate slice of PdfValue
 	filters := make([]*PdfValue, 0)
@@ -1431,16 +1512,33 @@ func (this *PdfReader) rebuildContentStream(content *PdfValue) ([]byte, error) {
 			// Uncompress zlib compressed data
 			var out bytes.Buffer
 			zlibReader, _ := zlib.NewReader(bytes.NewBuffer(stream))
+
 			defer zlibReader.Close()
 			io.Copy(&out, zlibReader)
 
 			// Set stream to uncompressed data
 			stream = out.Bytes()
+		case "/ASCII85Decode":
+			encoded := stream
+			// the -3 strips the end of data marker
+			decodedBytes, err := ioutil.ReadAll(ascii85.NewDecoder(bytes.NewBuffer(encoded[:len(encoded)-3])))
+			if err != nil {
+				if strings.Contains(err.Error(), "illegal ascii85 data") {
+					asciiDecodeErr = &Ascii85DecodeError{Message: err.Error()}
+				} else {
+					return nil, err
+				}
+			}
+			stream = decodedBytes
+
 		default:
-			return nil, errors.New("Unspported filter: " + filters[i].Token)
+			return nil, errors.New("Unsupported filter: " + filters[i].Token)
 		}
 	}
 
+	if asciiDecodeErr != nil {
+		return stream, asciiDecodeErr
+	}
 	return stream, nil
 }
 
